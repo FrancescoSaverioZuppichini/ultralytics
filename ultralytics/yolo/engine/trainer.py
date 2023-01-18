@@ -30,7 +30,7 @@ from ultralytics.yolo.data.utils import check_dataset, check_dataset_yaml
 from ultralytics.yolo.utils import (DEFAULT_CONFIG, LOGGER, RANK, SETTINGS, TQDM_BAR_FORMAT, callbacks, colorstr,
                                     yaml_save)
 from ultralytics.yolo.utils.autobatch import check_train_batch_size
-from ultralytics.yolo.utils.checks import check_file, print_args
+from ultralytics.yolo.utils.checks import check_file, check_imgsz, print_args
 from ultralytics.yolo.utils.dist import ddp_cleanup, generate_ddp_command
 from ultralytics.yolo.utils.files import get_latest_run, increment_path
 from ultralytics.yolo.utils.torch_utils import ModelEMA, de_parallel, init_seeds, one_cycle, strip_optimizer
@@ -40,7 +40,7 @@ class BaseTrainer:
     """
     BaseTrainer
 
-    > A base class for creating trainers.
+    A base class for creating trainers.
 
     Attributes:
         args (OmegaConf): Configuration for the trainer.
@@ -75,7 +75,7 @@ class BaseTrainer:
 
     def __init__(self, config=DEFAULT_CONFIG, overrides=None):
         """
-        > Initializes the BaseTrainer class.
+        Initializes the BaseTrainer class.
 
         Args:
             config (str, optional): Path to a configuration file. Defaults to DEFAULT_CONFIG.
@@ -84,6 +84,7 @@ class BaseTrainer:
         if overrides is None:
             overrides = {}
         self.args = get_config(config, overrides)
+        self.device = utils.torch_utils.select_device(self.args.device, self.args.batch)
         self.check_resume()
         self.console = LOGGER
         self.validator = None
@@ -113,7 +114,6 @@ class BaseTrainer:
             print_args(dict(self.args))
 
         # Device
-        self.device = utils.torch_utils.select_device(self.args.device, self.batch_size)
         self.amp = self.device.type != 'cpu'
         self.scaler = amp.GradScaler(enabled=self.amp)
         if self.device.type == 'cpu':
@@ -149,13 +149,13 @@ class BaseTrainer:
 
     def add_callback(self, event: str, callback):
         """
-        > Appends the given callback.
+        Appends the given callback.
         """
         self.callbacks[event].append(callback)
 
     def set_callback(self, event: str, callback):
         """
-        > Overrides the existing callbacks with the given callback.
+        Overrides the existing callbacks with the given callback.
         """
         self.callbacks[event] = [callback]
 
@@ -164,7 +164,15 @@ class BaseTrainer:
             callback(self)
 
     def train(self):
-        world_size = torch.cuda.device_count()
+        # Allow device='', device=None on Multi-GPU systems to default to device=0
+        if isinstance(self.args.device, int) or self.args.device:  # i.e. device=0 or device=[0,1,2,3]
+            world_size = torch.cuda.device_count()
+        elif torch.cuda.is_available():  # i.e. device=None or device=''
+            world_size = 1  # default to device 0
+        else:  # i.e. device='cpu' or 'mps'
+            world_size = 0
+
+        # Run subprocess if DDP training, else train normally
         if world_size > 1 and "LOCAL_RANK" not in os.environ:
             command = generate_ddp_command(world_size, self)
             try:
@@ -186,7 +194,7 @@ class BaseTrainer:
 
     def _setup_train(self, rank, world_size):
         """
-        > Builds dataloaders and optimizer on correct rank process.
+        Builds dataloaders and optimizer on correct rank process.
         """
         # model
         self.run_callbacks("on_pretrain_routine_start")
@@ -195,7 +203,9 @@ class BaseTrainer:
         self.set_model_attributes()
         if world_size > 1:
             self.model = DDP(self.model, device_ids=[rank])
-
+        # Check imgsz
+        gs = max(int(self.model.stride.max() if hasattr(self.model, 'stride') else 32), 32)  # grid size (max stride)
+        self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs * 2)
         # Batch size
         if self.batch_size == -1:
             if RANK == -1:  # single-GPU only, estimate best batch size
@@ -375,13 +385,13 @@ class BaseTrainer:
 
     def get_dataset(self, data):
         """
-        > Get train, val path from data dict if it exists. Returns None if data format is not recognized.
+        Get train, val path from data dict if it exists. Returns None if data format is not recognized.
         """
         return data["train"], data.get("val") or data.get("test")
 
     def setup_model(self):
         """
-        > load/create/download model for any task.
+        load/create/download model for any task.
         """
         if isinstance(self.model, torch.nn.Module):  # if model is loaded beforehand. No setup needed
             return
@@ -407,13 +417,13 @@ class BaseTrainer:
 
     def preprocess_batch(self, batch):
         """
-        > Allows custom preprocessing model inputs and ground truths depending on task type.
+        Allows custom preprocessing model inputs and ground truths depending on task type.
         """
         return batch
 
     def validate(self):
         """
-        > Runs validation on test set using self.validator. The returned dict is expected to contain "fitness" key.
+        Runs validation on test set using self.validator. The returned dict is expected to contain "fitness" key.
         """
         metrics = self.validator(self)
         fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
@@ -423,7 +433,7 @@ class BaseTrainer:
 
     def log(self, text, rank=-1):
         """
-        > Logs the given text to given ranks process if provided, otherwise logs to all ranks.
+        Logs the given text to given ranks process if provided, otherwise logs to all ranks.
 
         Args"
             text (str): text to log
@@ -441,13 +451,13 @@ class BaseTrainer:
 
     def get_dataloader(self, dataset_path, batch_size=16, rank=0):
         """
-        > Returns dataloader derived from torch.data.Dataloader.
+        Returns dataloader derived from torch.data.Dataloader.
         """
         raise NotImplementedError("get_dataloader function not implemented in trainer")
 
     def criterion(self, preds, batch):
         """
-        > Returns loss and individual loss items as Tensor.
+        Returns loss and individual loss items as Tensor.
         """
         raise NotImplementedError("criterion function not implemented in trainer")
 
@@ -498,10 +508,12 @@ class BaseTrainer:
     def check_resume(self):
         resume = self.args.resume
         if resume:
-            last = Path(check_file(resume) if isinstance(resume, str) else get_latest_run())
+            last = Path(check_file(resume) if isinstance(resume, (str, Path)) else get_latest_run())
             args_yaml = last.parent.parent / 'args.yaml'  # train options yaml
-            if args_yaml.is_file():
-                args = get_config(args_yaml)  # replace
+            assert args_yaml.is_file(), \
+                FileNotFoundError('Resume checkpoint f{last} not found. '
+                                  'Please pass a valid checkpoint to resume from, i.e. yolo resume=path/to/last.pt')
+            args = get_config(args_yaml)  # replace
             args.model, resume = str(last), True  # reinstate
             self.args = args
         self.resume = resume
@@ -533,7 +545,7 @@ class BaseTrainer:
     @staticmethod
     def build_optimizer(model, name='Adam', lr=0.001, momentum=0.9, decay=1e-5):
         """
-        > Builds an optimizer with the specified parameters and parameter groups.
+        Builds an optimizer with the specified parameters and parameter groups.
 
         Args:
             model (nn.Module): model to optimize
